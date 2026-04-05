@@ -1,0 +1,6 @@
+user_id,customer_contact,full_name,department,created_at
+1,alice@example.com,Alice Johnson,Engineering,01/15/2024
+2,bob@example.com,Bob Smith,Marketing,02/20/2024
+3,carol@example.com,Carol Williams,Product,03/10/2024
+4,dave@example.com,Dave Brown,Sales,04/05/2024
+5,eve@example.com,Eve Davis,Engineering,05/12/2024
