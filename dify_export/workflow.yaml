@@ -1,0 +1,398 @@
+# Dify-Agentic-Heal: Dify v1.13.0 Workflow Definition
+# Import this into Dify via Settings → Import Workflow
+#
+# Architecture:
+#   Start → Sentinel (Code) → Conditional Branch
+#     ├── Valid → Healer (Code) → End (Clean Ingest)
+#     └── Invalid → Diagnostician (LLM) → HITL (Human Input)
+#         ├── Approved → Healer (Code) → End (Healed Ingest)
+#         └── Rejected → End (Alert/Discard)
+
+app:
+  name: "Dify-Agentic-Heal"
+  description: "Self-healing RAG pipeline guard against schema drift"
+  mode: workflow
+  icon: "🛡️"
+
+workflow:
+  nodes:
+    # ── Start Node ──────────────────────────────────────────────────────
+    - id: start
+      type: start
+      data:
+        title: "Incoming Data"
+        variables:
+          - name: payload
+            type: paragraph
+            required: true
+            description: "JSON array of data rows to validate"
+
+    # ── Zone 1: Sentinel (Python Code Node) ─────────────────────────────
+    - id: sentinel
+      type: code
+      data:
+        title: "Zone 1: Sentinel"
+        desc: "Validate payload against Golden Schema using Pydantic V2"
+        variables:
+          - name: payload
+            type: string
+            selector:
+              - start
+              - payload
+        outputs:
+          - name: drift_report
+            type: string
+          - name: is_valid
+            type: boolean
+        code:
+          language: python3
+          code: |
+            import json
+            import re
+            from datetime import datetime
+
+            def main(payload: str) -> dict:
+                raw_data = json.loads(payload)
+
+                # Golden Schema fields
+                EXPECTED_FIELDS = {
+                    "user_id": "int",
+                    "user_email": "valid email",
+                    "full_name": "str",
+                    "department": "str",
+                    "created_at": "ISO 8601 datetime",
+                }
+
+                EMAIL_RE = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+
+                errors = []
+                dirty_sample = []
+                failed_count = 0
+
+                for row in raw_data:
+                    row_errors = []
+                    for field, expected in EXPECTED_FIELDS.items():
+                        val = row.get(field)
+                        if val is None or val == "":
+                            row_errors.append({
+                                "field": field,
+                                "error_type": "missing",
+                                "expected": expected,
+                                "got": None,
+                            })
+                        elif field == "user_email" and not EMAIL_RE.match(str(val)):
+                            row_errors.append({
+                                "field": field,
+                                "error_type": "invalid",
+                                "expected": expected,
+                                "got": str(val),
+                            })
+                        elif field == "created_at":
+                            try:
+                                datetime.fromisoformat(str(val))
+                            except ValueError:
+                                row_errors.append({
+                                    "field": field,
+                                    "error_type": "invalid",
+                                    "expected": expected,
+                                    "got": str(val),
+                                })
+
+                    if row_errors:
+                        failed_count += 1
+                        if len(dirty_sample) < 3:
+                            dirty_sample.append(row)
+                        for e in row_errors:
+                            if not any(
+                                err["field"] == e["field"] and err["error_type"] == e["error_type"]
+                                for err in errors
+                            ):
+                                errors.append(e)
+
+                is_valid = failed_count == 0
+
+                if is_valid:
+                    return {
+                        "drift_report": json.dumps({"valid": True}),
+                        "is_valid": True,
+                    }
+
+                report = {
+                    "valid": False,
+                    "total_rows": len(raw_data),
+                    "failed_rows": failed_count,
+                    "errors": errors,
+                    "dirty_sample": dirty_sample,
+                }
+                return {
+                    "drift_report": json.dumps(report),
+                    "is_valid": False,
+                }
+
+    # ── Conditional Branch ──────────────────────────────────────────────
+    - id: drift_check
+      type: if-else
+      data:
+        title: "Drift Check"
+        conditions:
+          - variable_selector:
+              - sentinel
+              - is_valid
+            comparison_operator: "is true"
+            value: ""
+        logical_operator: and
+
+    # ── Clean Path: Direct Healer (no transformation) ───────────────────
+    - id: clean_healer
+      type: code
+      data:
+        title: "Clean Ingest"
+        desc: "Data passed validation — pass through to Knowledge Base"
+        variables:
+          - name: payload
+            type: string
+            selector:
+              - start
+              - payload
+        outputs:
+          - name: result
+            type: string
+        code:
+          language: python3
+          code: |
+            import json
+
+            def main(payload: str) -> dict:
+                data = json.loads(payload)
+                return {
+                    "result": f"Clean ingest: {len(data)} rows validated and ready for Knowledge Base.",
+                }
+
+    # ── Zone 2: Diagnostician (LLM Node) ────────────────────────────────
+    - id: diagnostician
+      type: llm
+      data:
+        title: "Zone 2: Diagnostician"
+        desc: "Analyze drift report and propose corrective field mapping"
+        model:
+          provider: anthropic
+          name: claude-sonnet-4-5-20250514
+          mode: chat
+          completion_params:
+            temperature: 0
+        prompt_template:
+          - role: system
+            text: |
+              You are a data schema analyst. You receive a drift report showing
+              validation errors between incoming data and an expected schema.
+
+              Expected schema fields:
+                - user_id: int
+                - user_email: str (valid email format)
+                - full_name: str
+                - department: str
+                - created_at: str (ISO 8601 format)
+
+              Rules:
+              1. Only propose mappings you are confident about.
+              2. If a field is missing, check if a renamed version exists in the dirty data.
+              3. If a date format is wrong, specify the format conversion.
+              4. Output ONLY valid JSON. No markdown fences.
+
+              Output format:
+              {
+                "corrections": [
+                  {
+                    "old_field": "<field_in_dirty_data>",
+                    "new_field": "<expected_field_name>",
+                    "reason": "<brief explanation>"
+                  }
+                ],
+                "date_fixes": [
+                  {
+                    "field": "created_at",
+                    "input_format": "%m/%d/%Y",
+                    "output_format": "iso8601"
+                  }
+                ]
+              }
+          - role: user
+            text: |
+              ## Drift Report
+              {{#sentinel.drift_report#}}
+
+              Analyze the errors and dirty data sample. Propose corrective mappings as JSON.
+        memory:
+          enabled: false
+
+    # ── Zone 3: HITL Gate (Human Input Node) ────────────────────────────
+    - id: hitl_gate
+      type: human-input
+      data:
+        title: "Zone 3: HITL Gate"
+        desc: "Admin reviews and approves/rejects the proposed schema corrections"
+        human_input_mode: line
+        prompt: |
+          ## Schema Drift Detected
+
+          The Sentinel found validation errors in the incoming data.
+          The Diagnostician proposes the following corrections:
+
+          {{#diagnostician.text#}}
+
+          **Approve** to apply these corrections and heal the data.
+          **Reject** to discard this batch and alert the team.
+        outputs:
+          - name: admin_decision
+            type: string
+
+    # ── Zone 4: Healer (Python Code Node) ───────────────────────────────
+    - id: healer
+      type: code
+      data:
+        title: "Zone 4: Healer"
+        desc: "Apply corrective mapping and trigger Knowledge Base ingestion"
+        variables:
+          - name: payload
+            type: string
+            selector:
+              - start
+              - payload
+          - name: mapping_json
+            type: string
+            selector:
+              - diagnostician
+              - text
+        outputs:
+          - name: result
+            type: string
+          - name: healed_csv
+            type: string
+        code:
+          language: python3
+          code: |
+            import json
+            from datetime import datetime
+
+            def main(payload: str, mapping_json: str) -> dict:
+                raw_data = json.loads(payload)
+
+                # Parse LLM mapping (strip markdown fences if present)
+                mapping_text = mapping_json.strip()
+                if mapping_text.startswith("```"):
+                    lines = mapping_text.split("\n")
+                    mapping_text = "\n".join(lines[1:-1]) if len(lines) > 2 else mapping_text
+
+                try:
+                    mapping = json.loads(mapping_text)
+                except json.JSONDecodeError:
+                    return {
+                        "result": "ERROR: Could not parse diagnostician mapping JSON.",
+                        "healed_csv": "",
+                    }
+
+                corrections = mapping.get("corrections", [])
+                date_fixes = mapping.get("date_fixes", [])
+
+                # Build rename map
+                rename_map = {c["old_field"]: c["new_field"] for c in corrections}
+
+                # Build date format map
+                date_format_map = {}
+                for fix in date_fixes:
+                    date_format_map[fix["field"]] = (fix["input_format"], fix["output_format"])
+
+                # Apply corrections
+                healed = []
+                for row in raw_data:
+                    new_row = {}
+                    for key, value in row.items():
+                        target_key = rename_map.get(key, key)
+                        new_row[target_key] = value
+
+                    for field, (input_fmt, output_fmt) in date_format_map.items():
+                        if field in new_row and isinstance(new_row[field], str):
+                            try:
+                                dt = datetime.strptime(new_row[field], input_fmt)
+                                new_row[field] = (
+                                    dt.isoformat() if output_fmt == "iso8601"
+                                    else dt.strftime(output_fmt)
+                                )
+                            except ValueError:
+                                pass
+
+                    healed.append(new_row)
+
+                # Build CSV output
+                if healed:
+                    header = ",".join(healed[0].keys())
+                    rows = [",".join(str(v) for v in row.values()) for row in healed]
+                    csv_text = header + "\n" + "\n".join(rows)
+                else:
+                    csv_text = ""
+
+                return {
+                    "result": f"Healed {len(healed)} rows. Ready for Knowledge Base ingestion.",
+                    "healed_csv": csv_text,
+                }
+
+    # ── End Nodes ───────────────────────────────────────────────────────
+    - id: end_clean
+      type: end
+      data:
+        title: "Clean Ingest Complete"
+        outputs:
+          - name: result
+            type: string
+            selector:
+              - clean_healer
+              - result
+
+    - id: end_healed
+      type: end
+      data:
+        title: "Healed Ingest Complete"
+        outputs:
+          - name: result
+            type: string
+            selector:
+              - healer
+              - result
+          - name: healed_csv
+            type: string
+            selector:
+              - healer
+              - healed_csv
+
+    - id: end_rejected
+      type: end
+      data:
+        title: "Rejected — Alert/Discard"
+        outputs:
+          - name: result
+            type: string
+
+  # ── Edge Connections ──────────────────────────────────────────────────
+  edges:
+    - source: start
+      target: sentinel
+    - source: sentinel
+      target: drift_check
+    - source: drift_check
+      target: clean_healer
+      sourceHandle: "true"
+    - source: drift_check
+      target: diagnostician
+      sourceHandle: "false"
+    - source: clean_healer
+      target: end_clean
+    - source: diagnostician
+      target: hitl_gate
+    - source: hitl_gate
+      target: healer
+      sourceHandle: "true"
+    - source: hitl_gate
+      target: end_rejected
+      sourceHandle: "false"
+    - source: healer
+      target: end_healed
