@@ -1,0 +1,68 @@
+# Before — Direct Ingest (No Guardian)
+# Import this into Dify to demonstrate the "silent poisoning" problem.
+# Broken data uploads directly to the Knowledge Base with NO validation.
+
+app:
+  name: "Before — Direct Ingest (No Guardian)"
+  description: "Demonstrates broken data silently poisoning the Knowledge Base with no validation"
+  mode: workflow
+  icon: "⚠️"
+
+workflow:
+  nodes:
+    # ── Start Node ──────────────────────────────────────────────────────
+    - id: start
+      type: start
+      data:
+        title: "Incoming Data"
+        variables:
+          - name: payload
+            type: paragraph
+            required: true
+            description: "JSON array of data rows to ingest directly"
+
+    # ── Direct KB Upload (no validation) ────────────────────────────────
+    - id: upload
+      type: http-request
+      data:
+        title: "Direct KB Upload"
+        desc: "Uploads data directly to Knowledge Base — NO schema validation"
+        method: POST
+        url: "{{#sys.DIFY_BASE_URL#}}/v1/datasets/{{#sys.DIFY_DATASET_ID#}}/document/create-by-text"
+        headers:
+          - key: Authorization
+            value: "Bearer {{#sys.DIFY_API_KEY#}}"
+            enabled: true
+          - key: Content-Type
+            value: application/json
+            enabled: true
+        body:
+          type: json
+          json: |
+            {
+              "name": "direct_broken_import",
+              "text": {{#start.payload#}},
+              "data_source": { "type": "upload_file" }
+            }
+        outputs:
+          - name: response
+            type: string
+
+    # ── End ─────────────────────────────────────────────────────────────
+    - id: end
+      type: end
+      data:
+        title: "Done (Silently Corrupted)"
+        outputs:
+          - name: result
+            type: string
+            selector:
+              - upload
+              - response
+
+  # ── Edge Connections ──────────────────────────────────────────────────
+  edges:
+    - source: start
+      target: upload
+    - source: upload
+      target: end
