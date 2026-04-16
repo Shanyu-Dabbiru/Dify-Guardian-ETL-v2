@@ -85,81 +85,79 @@ def _upload_to_dify_kb(healed: list[dict]) -> str | None:
         return f"Dify upload skipped: {exc}"
 
 
-def run_pipeline(csv_path: str, *, simulate_approval: bool = True) -> str:
-    """Run the full 4-zone pipeline on a CSV file.
+def run_pipeline(csv_path: str, *, simulate_approval: bool = False) -> str:
+    """Run the 4-step guardrailed pipeline on a CSV file.
 
     Returns a human-readable summary string.
     """
     raw_data = load_csv(csv_path)
 
-    # ── Zone 1: Sentinel ───────────────────────────────────────────────
+    # ── Step 1: Validation ─────────────────────────────────────────────
     result = validate_payload(raw_data)
 
     if isinstance(result, list):
         # All rows valid — clean ingest path
         return (
-            f"[SENTINEL] PASS — {len(result)} rows validated. "
-            f"Proceeding to Knowledge Base ingestion.\n"
-            f"[HEALER] Data is clean, no transformation needed."
+            f"[VALIDATION] PASS — {len(result)} rows match the master schema.\n"
+            f"[REPAIR] No fixes needed."
         )
 
     # Drift detected
     drift_report: DriftReport = result
-    summary = [drift_report.to_summary()]
+    summary = [f"[VALIDATION] FAIL: Schema drift detected in {drift_report.failed_rows} rows."]
 
-    # ── Zone 2: Diagnostician (real LLM or simulation) ─────────────────
+    # ── Step 2: Reasoning (AI Models) ──────────────────────────────────
     prompt = build_drift_prompt(drift_report)
     mapping = _get_llm_diagnosis(prompt)
 
     if USE_SIMULATED_LLM:
-        summary.append(f"\n[DIAGNOSTICIAN] Simulated LLM response:\n{json.dumps(mapping, indent=2)}")
+        summary.append(f"\n[AI REASONING] Simulated mapping proposal:\n{json.dumps(mapping, indent=2)}")
     else:
-        summary.append("[DIAGNOSTICIAN] Real LLM response received.")
+        summary.append("[AI REASONING] Correction proposal generated.")
 
-    # ── Zone 3: HITL Gate ──────────────────────────────────────────────
+    # ── Step 3: Review Gate (HITL) ─────────────────────────────────────
     corrections = mapping["corrections"]
     date_fixes = mapping.get("date_fixes", [])
 
-    md_proposal = "## Proposed Corrections\n\n"
+    md_proposal = "PROPOSED CORRECTIONS:\n"
     for c in corrections:
-        md_proposal += f"- **{c['old_field']}** → **{c['new_field']}**: {c['reason']}\n"
+        md_proposal += f"  • {c['old_field']} -> {c['new_field']} ({c['reason']})\n"
     for d in date_fixes:
-        md_proposal += f"- **{d['field']}**: Convert `{d['input_format']}` → `{d['output_format']}`\n"
+        md_proposal += f"  • {d['field']}: Convert {d['input_format']} -> {d['output_format']}\n"
 
-    summary.append(f"\n[HITL] Proposal for admin review:\n{md_proposal}")
-
+    summary.append(f"\n[REVIEW] Proposed fixes:\n{md_proposal}")
+    
+    # Print the current summary so the user sees the proposal before the input prompt
+    print("\n".join(summary))
+    
+    approval = "y"
     if not simulate_approval:
-        summary.append("[HITL] REJECTED — pipeline halted.")
-        return "\n".join(summary)
+        approval = input("\n> Approve these fixes to repair the data? (y/n): ").lower().strip()
+    
+    if approval != "y":
+        return "[REVIEW] REJECTED — Pipeline halted. Data not pushed to Knowledge Base."
 
-    summary.append("[HITL] APPROVED — applying corrections.")
+    print("[REVIEW] APPROVED — Applying repairs...")
+    summary_final = ["[REVIEW] APPROVED — Applying repairs..."]
 
-    # ── Zone 4: Healer ──────────────────────────────────────────────────
+    # ── Step 4: Repair ──────────────────────────────────────────────────
     healed = apply_corrections(raw_data, corrections, date_fixes)
 
-    # Validate healed data against Golden Schema
+    # Validate healed data against Master Schema
     healed_result = validate_payload(healed)
     if isinstance(healed_result, list):
-        summary.append(f"[HEALER] {len(healed_result)} rows healed and validated.")
-
-        # Show healed data as CSV
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=healed[0].keys())
-        writer.writeheader()
-        writer.writerows(healed)
-        summary.append(f"\n[OUTPUT] Healed CSV:\n{output.getvalue()}")
+        summary_final.append(f"[REPAIR] SUCCESS: {len(healed_result)} rows repaired and verified.")
 
         # Optional: upload to Dify KB
         if healed:
             upload_msg = _upload_to_dify_kb(healed)
             if upload_msg:
-                summary.append(f"[HEALER] {upload_msg}")
+                summary_final.append(f"[REPAIR] {upload_msg}")
     else:
-        summary.append(f"[HEALER] ERROR — healed data still has errors:\n{healed_result.to_summary()}")
-        summary.append("[HEALER] PIPELINE HALTED — data not uploaded.")
-        return "\n".join(summary)
+        summary_final.append(f"[REPAIR] ERROR: Healed data still fails validation.")
+        return "\n".join(summary_final)
 
-    return "\n".join(summary)
+    return "\n".join(summary_final)
 
 
 if __name__ == "__main__":

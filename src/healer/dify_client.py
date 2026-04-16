@@ -38,14 +38,17 @@ class DifyKBClient:
         payload = {
             "name": name,
             "text": text,
-            "data_source": {
-                "type": "upload_file",
+            "indexing_technique": "economy",
+            "process_rule": {
+                "mode": "automatic",
             },
         }
         resp = self._client.post(
             f"/datasets/{dataset_id}/document/create-by-text",
             json=payload,
         )
+        if resp.status_code != 200:
+            print(f"DEBUG: Dify Error Response: {resp.text}")
         resp.raise_for_status()
         return resp.json()
 
